@@ -1,28 +1,24 @@
+package main
+
 import (
-	"fmt"
 	"log"
 	"net/http"
-	"os"      // <-- Adicione isso!
+	"os"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-// ==========================================
-// 1. CONSTANTES E TIMEOUTS
-// ==========================================
 const (
 	writeWait      = 10 * time.Second
 	pongWait       = 60 * time.Second
 	pingPeriod     = (pongWait * 9) / 10
-	maxMessageSize = 512000
+	maxMessageSize = 65536 // 64KB (Recomendação OWASP contra ataques DoS)
 )
 
-// ==========================================
-// 2. ESTRUTURAS DE DADOS
-// ==========================================
+// Estrutura padrão de troca de mensagens do Sinex Chat
 type Message struct {
-	Type      string `json:"type"` // "chat", "digitando", "status_check", "status_reply", "status_update"
+	Type      string `json:"type"`
 	From      string `json:"from"`
 	To        string `json:"to"`
 	Content   string `json:"content"`
@@ -42,14 +38,36 @@ type Hub struct {
 	Broadcast  chan Message
 }
 
+// Configuração do WebSocket (Upgrader) - BLINDADO
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
+	// Proteção contra Cross-Site WebSocket Hijacking (CSWSH)
 	CheckOrigin: func(r *http.Request) bool {
-		return true
+		origin := r.Header.Get("Origin")
+		
+		// ALLOWLIST DE ORIGENS CONFIÁVEIS
+		allowedOrigins := []string{
+			"https://chat-parameuamor.firebaseapp.com",
+			"https://chat-parameuamor.web.app",
+			"http://localhost:8080",
+			"http://localhost:3000",
+			"http://localhost:5500",
+			"http://127.0.0.1:5500",
+			"http://127.0.0.1:3000",
+		}
+
+		for _, allowed := range allowedOrigins {
+			if origin == allowed {
+				return true
+			}
+		}
+		log.Printf("[BLOQUEIO DE SEGURANÇA] Origem não autorizada bloqueada: %s", origin)
+		return false
 	},
 }
 
+// Instância global do Hub de conexões
 var chatHub = &Hub{
 	Clients:    make(map[string]*Client),
 	Register:   make(chan *Client),
@@ -57,29 +75,21 @@ var chatHub = &Hub{
 	Broadcast:  make(chan Message),
 }
 
-// ==========================================
-// 3. SISTEMA DE PRESENÇA
-// ==========================================
-// Avisa todo mundo quem entrou ou saiu
+// Emite eventos online/offline para os usuários conectados
 func (h *Hub) broadcastPresence(username string, status string) {
-	msg := Message{
-		Type:    "status_update",
-		From:    username,
-		Content: status,
-	}
+	msg := Message{Type: "status_update", From: username, Content: status}
 	for _, client := range h.Clients {
 		if client.Username != username {
 			select {
 			case client.Send <- msg:
 			default:
+				// Fila cheia, ignora
 			}
 		}
 	}
 }
 
-// ==========================================
-// 4. O CORAÇÃO DO SERVIDOR
-// ==========================================
+// Gerenciador principal do Hub
 func (h *Hub) Run() {
 	for {
 		select {
@@ -89,36 +99,31 @@ func (h *Hub) Run() {
 				delete(h.Clients, client.Username)
 			}
 			h.Clients[client.Username] = client
-			fmt.Println("🟢 Online:", client.Username, "| Total:", len(h.Clients))
-			h.broadcastPresence(client.Username, "online") // Avisa que entrou
+			log.Printf("[+] Usuário conectado: %s", client.Username)
+			h.broadcastPresence(client.Username, "online")
 
 		case client := <-h.Unregister:
 			if currentClient, ok := h.Clients[client.Username]; ok && currentClient == client {
 				delete(h.Clients, client.Username)
 				close(client.Send)
-				fmt.Println("🔴 Offline:", client.Username, "| Total:", len(h.Clients))
-				h.broadcastPresence(client.Username, "offline") // Avisa que saiu
+				log.Printf("[-] Usuário desconectado: %s", client.Username)
+				h.broadcastPresence(client.Username, "offline")
 			}
 
 		case message := <-h.Broadcast:
-			// SISTEMA NOVO: Alguém perguntou se um contato está online
+			// Lógica de Status em Tempo Real
 			if message.Type == "status_check" {
 				status := "offline"
 				if _, ok := h.Clients[message.To]; ok {
 					status = "online"
 				}
 				if sender, ok := h.Clients[message.From]; ok {
-					sender.Send <- Message{
-						Type:    "status_reply",
-						From:    message.To,
-						To:      message.From,
-						Content: status,
-					}
+					sender.Send <- Message{Type: "status_reply", From: message.To, To: message.From, Content: status}
 				}
-				continue // Não repassa essa mensagem, o Go já respondeu!
+				continue
 			}
 
-			// Roteamento normal de Chat e Digitando
+			// Roteamento de mensagens diretas e chamadas
 			if targetClient, ok := h.Clients[message.To]; ok {
 				select {
 				case targetClient.Send <- message:
@@ -132,9 +137,7 @@ func (h *Hub) Run() {
 	}
 }
 
-// ==========================================
-// 5. MOTOR DE ESCRITA E LEITURA
-// ==========================================
+// Ciclo de leitura (Recebe dados do Frontend)
 func (c *Client) readPump() {
 	defer func() {
 		chatHub.Unregister <- c
@@ -142,21 +145,22 @@ func (c *Client) readPump() {
 	}()
 	c.Conn.SetReadLimit(maxMessageSize)
 	c.Conn.SetReadDeadline(time.Now().Add(pongWait))
-	c.Conn.SetPongHandler(func(string) error {
-		c.Conn.SetReadDeadline(time.Now().Add(pongWait))
-		return nil
-	})
+	c.Conn.SetPongHandler(func(string) error { c.Conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
 
 	for {
 		var msg Message
 		err := c.Conn.ReadJSON(&msg)
 		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("[!] Erro de leitura WS (%s): %v", c.Username, err)
+			}
 			break
 		}
 		chatHub.Broadcast <- msg
 	}
 }
 
+// Ciclo de escrita (Envia dados para o Frontend)
 func (c *Client) writePump() {
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {
@@ -173,7 +177,6 @@ func (c *Client) writePump() {
 				return
 			}
 			c.Conn.WriteJSON(msg)
-
 		case <-ticker.C:
 			c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := c.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
@@ -183,46 +186,47 @@ func (c *Client) writePump() {
 	}
 }
 
-// ==========================================
-// 6. ROTA E MAIN
-// ==========================================
+// Endpoint de conexão do WebSocket
 func serveWs(w http.ResponseWriter, r *http.Request) {
 	username := r.URL.Query().Get("user")
-	if username == "" {
-		http.Error(w, "Usuário não informado", http.StatusBadRequest)
+	token := r.URL.Query().Get("token")
+
+	// Prevenção inicial de acesso sem token (transição suave para a Etapa 4)
+	if username == "" || token == "" {
+		http.Error(w, "Acesso Negado. Credenciais ausentes.", http.StatusUnauthorized)
+		log.Printf("[BLOQUEIO] Tentativa de acesso não autorizada: user=%s", username)
 		return
 	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Println("Erro no Upgrade WebSocket:", err)
+		log.Printf("[ERRO] Falha no Upgrade do WebSocket: %v", err)
 		return
 	}
 
-	client := &Client{
-		Username: username,
-		Conn:     conn,
-		Send:     make(chan Message, 256),
-	}
-
+	client := &Client{Username: username, Conn: conn, Send: make(chan Message, 256)}
 	chatHub.Register <- client
 
 	go client.writePump()
 	go client.readPump()
 }
-func main() {
-	fmt.Println("================================================")
-	fmt.Println("🚀 MOTOR WEBSOCKET DO SINEX CHAT ATIVADO!")
-	fmt.Println("================================================")
 
+func main() {
 	go chatHub.Run()
+
 	http.HandleFunc("/ws", serveWs)
-	
-	// 👇 Muda aqui! Pega a porta que o Render vai fornecer
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("Sinex Chat Backend Seguro Ativo!"))
+	})
+
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080" // Porta padrão para rodar no seu PC
+		port = "8080"
 	}
-	
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+
+	log.Printf("🚀 Servidor WebSocket do Sinex Chat iniciado na porta %s", port)
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		log.Fatal("Erro fatal no servidor: ", err)
+	}
 }
