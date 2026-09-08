@@ -1,223 +1,160 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-const (
-	writeWait      = 10 * time.Second
-	pongWait       = 60 * time.Second
-	pingPeriod     = (pongWait * 9) / 10
-	maxMessageSize = 65536 // 64KB (Recomendação OWASP contra ataques DoS)
-)
-
-// Estrutura padrão de troca de mensagens do Sinex Chat
-type Message struct {
-	Type      string `json:"type"`
-	From      string `json:"from"`
-	To        string `json:"to"`
-	Content   string `json:"content"`
-	Timestamp int64  `json:"timestamp"`
+var origensPadrao = []string{
+	"https://chat-parameuamor.firebaseapp.com",
+	"https://chat-parameuamor.web.app",
+	"http://localhost:8080",
+	"http://localhost:3000",
+	"http://localhost:5500",
+	"http://127.0.0.1:5500",
+	"http://127.0.0.1:3000",
 }
 
-type Client struct {
-	Username string
-	Conn     *websocket.Conn
-	Send     chan Message
-}
-
-type Hub struct {
-	Clients    map[string]*Client
-	Register   chan *Client
-	Unregister chan *Client
-	Broadcast  chan Message
-}
-
-// Configuração do WebSocket (Upgrader) - BLINDADO
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	// Proteção contra Cross-Site WebSocket Hijacking (CSWSH)
-	CheckOrigin: func(r *http.Request) bool {
-		origin := r.Header.Get("Origin")
-		
-		// ALLOWLIST DE ORIGENS CONFIÁVEIS
-		allowedOrigins := []string{
-			"https://chat-parameuamor.firebaseapp.com",
-			"https://chat-parameuamor.web.app",
-			"http://localhost:8080",
-			"http://localhost:3000",
-			"http://localhost:5500",
-			"http://127.0.0.1:5500",
-			"http://127.0.0.1:3000",
-		}
-
-		for _, allowed := range allowedOrigins {
-			if origin == allowed {
-				return true
-			}
-		}
-		log.Printf("[BLOQUEIO DE SEGURANÇA] Origem não autorizada bloqueada: %s", origin)
-		return false
-	},
-}
-
-// Instância global do Hub de conexões
-var chatHub = &Hub{
-	Clients:    make(map[string]*Client),
-	Register:   make(chan *Client),
-	Unregister: make(chan *Client),
-	Broadcast:  make(chan Message),
-}
-
-// Emite eventos online/offline para os usuários conectados
-func (h *Hub) broadcastPresence(username string, status string) {
-	msg := Message{Type: "status_update", From: username, Content: status}
-	for _, client := range h.Clients {
-		if client.Username != username {
-			select {
-			case client.Send <- msg:
-			default:
-				// Fila cheia, ignora
-			}
-		}
-	}
-}
-
-// Gerenciador principal do Hub
-func (h *Hub) Run() {
-	for {
-		select {
-		case client := <-h.Register:
-			if oldClient, ok := h.Clients[client.Username]; ok {
-				close(oldClient.Send)
-				delete(h.Clients, client.Username)
-			}
-			h.Clients[client.Username] = client
-			log.Printf("[+] Usuário conectado: %s", client.Username)
-			h.broadcastPresence(client.Username, "online")
-
-		case client := <-h.Unregister:
-			if currentClient, ok := h.Clients[client.Username]; ok && currentClient == client {
-				delete(h.Clients, client.Username)
-				close(client.Send)
-				log.Printf("[-] Usuário desconectado: %s", client.Username)
-				h.broadcastPresence(client.Username, "offline")
-			}
-
-		case message := <-h.Broadcast:
-			// Lógica de Status em Tempo Real
-			if message.Type == "status_check" {
-				status := "offline"
-				if _, ok := h.Clients[message.To]; ok {
-					status = "online"
-				}
-				if sender, ok := h.Clients[message.From]; ok {
-					sender.Send <- Message{Type: "status_reply", From: message.To, To: message.From, Content: status}
-				}
-				continue
-			}
-
-			// Roteamento de mensagens diretas e chamadas
-			if targetClient, ok := h.Clients[message.To]; ok {
-				select {
-				case targetClient.Send <- message:
-				default:
-					close(targetClient.Send)
-					delete(h.Clients, targetClient.Username)
-					h.broadcastPresence(targetClient.Username, "offline")
-				}
-			}
-		}
-	}
-}
-
-// Ciclo de leitura (Recebe dados do Frontend)
-func (c *Client) readPump() {
-	defer func() {
-		chatHub.Unregister <- c
-		c.Conn.Close()
-	}()
-	c.Conn.SetReadLimit(maxMessageSize)
-	c.Conn.SetReadDeadline(time.Now().Add(pongWait))
-	c.Conn.SetPongHandler(func(string) error { c.Conn.SetReadDeadline(time.Now().Add(pongWait)); return nil })
-
-	for {
-		var msg Message
-		err := c.Conn.ReadJSON(&msg)
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("[!] Erro de leitura WS (%s): %v", c.Username, err)
-			}
-			break
-		}
-		chatHub.Broadcast <- msg
-	}
-}
-
-// Ciclo de escrita (Envia dados para o Frontend)
-func (c *Client) writePump() {
-	ticker := time.NewTicker(pingPeriod)
-	defer func() {
-		ticker.Stop()
-		c.Conn.Close()
-	}()
-
-	for {
-		select {
-		case msg, ok := <-c.Send:
-			c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if !ok {
-				c.Conn.WriteMessage(websocket.CloseMessage, []byte{})
-				return
-			}
-			c.Conn.WriteJSON(msg)
-		case <-ticker.C:
-			c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if err := c.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-				return
-			}
-		}
-	}
-}
-
-// Endpoint de conexão do WebSocket
-func serveWs(w http.ResponseWriter, r *http.Request) {
-	username := r.URL.Query().Get("user")
-	token := r.URL.Query().Get("token")
-
-	// Prevenção inicial de acesso sem token (transição suave para a Etapa 4)
-	if username == "" || token == "" {
-		http.Error(w, "Acesso Negado. Credenciais ausentes.", http.StatusUnauthorized)
-		log.Printf("[BLOQUEIO] Tentativa de acesso não autorizada: user=%s", username)
-		return
+func origensPermitidas() map[string]bool {
+	lista := origensPadrao
+	if extra := os.Getenv("ALLOWED_ORIGINS"); extra != "" {
+		lista = append(lista, strings.Split(extra, ",")...)
 	}
 
-	conn, err := upgrader.Upgrade(w, r, nil)
+	set := make(map[string]bool, len(lista))
+	for _, o := range lista {
+		if o = strings.TrimSpace(o); o != "" {
+			set[o] = true
+		}
+	}
+	return set
+}
+
+type servidor struct {
+	hub      *Hub
+	identity *Identity
+	upgrader websocket.Upgrader
+}
+
+// mensagemAuth é o primeiro quadro que o cliente deve enviar após o handshake.
+// O token vem por aqui, e não na query string, para não vazar em logs de
+// acesso e proxies.
+type mensagemAuth struct {
+	Type  string `json:"type"`
+	Token string `json:"token"`
+}
+
+func (s *servidor) serveWs(w http.ResponseWriter, r *http.Request) {
+	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("[ERRO] Falha no Upgrade do WebSocket: %v", err)
 		return
 	}
 
-	client := &Client{Username: username, Conn: conn, Send: make(chan Message, 256)}
-	chatHub.Register <- client
+	// O cliente tem uma janela curta para se identificar.
+	conn.SetReadLimit(maxMessageSize)
+	if err := conn.SetReadDeadline(time.Now().Add(authWait)); err != nil {
+		conn.Close()
+		return
+	}
+
+	var quadro mensagemAuth
+	if err := conn.ReadJSON(&quadro); err != nil || quadro.Type != "auth" || quadro.Token == "" {
+		fecharCom(conn, websocket.ClosePolicyViolation, "handshake de autenticacao ausente")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	ident, err := s.identity.Verificar(ctx, quadro.Token)
+	if err != nil {
+		motivo := "token invalido"
+		switch {
+		case errors.Is(err, ErrContaBloqueada):
+			motivo = "conta suspensa ou banida"
+		case errors.Is(err, ErrSemIdentidade):
+			motivo = "perfil nao encontrado"
+		}
+		log.Printf("[auth] recusado (%s): %v", motivo, err)
+		fecharCom(conn, websocket.ClosePolicyViolation, motivo)
+		return
+	}
+
+	client := &Client{
+		Username:     ident.Username,
+		UID:          ident.UID,
+		Conn:         conn,
+		Send:         make(chan Message, 256),
+		hub:          s.hub,
+		janelaInicio: time.Now(),
+	}
+
+	s.hub.Register <- client
+
+	// Confirma para o cliente qual identidade o servidor reconheceu.
+	client.Send <- Message{Type: "auth_ok", To: ident.Username, Content: ident.Username}
 
 	go client.writePump()
 	go client.readPump()
 }
 
-func main() {
-	go chatHub.Run()
+func fecharCom(conn *websocket.Conn, codigo int, motivo string) {
+	conn.SetWriteDeadline(time.Now().Add(writeWait))
+	conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(codigo, motivo))
+	conn.Close()
+}
 
-	http.HandleFunc("/ws", serveWs)
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+func main() {
+	ctx := context.Background()
+
+	projectID := os.Getenv("FIREBASE_PROJECT_ID")
+	if projectID == "" {
+		projectID = "chat-parameuamor"
+	}
+
+	identity, err := NovaIdentity(ctx, projectID, os.Getenv("FIREBASE_SERVICE_ACCOUNT_JSON"))
+	if err != nil {
+		log.Fatalf("nao foi possivel inicializar o Firebase Admin: %v", err)
+	}
+	defer identity.Close()
+
+	hub := NovoHub(identity)
+	go hub.Run()
+
+	permitidas := origensPermitidas()
+	s := &servidor{
+		hub:      hub,
+		identity: identity,
+		upgrader: websocket.Upgrader{
+			ReadBufferSize:  1024,
+			WriteBufferSize: 1024,
+			CheckOrigin: func(r *http.Request) bool {
+				origin := r.Header.Get("Origin")
+				if permitidas[origin] {
+					return true
+				}
+				log.Printf("[bloqueio] origem nao autorizada: %q", origin)
+				return false
+			},
+		},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", s.serveWs)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Sinex Chat Backend Seguro Ativo!"))
+		w.Write([]byte("ok"))
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("Sinex Chat Backend ativo"))
 	})
 
 	port := os.Getenv("PORT")
@@ -225,8 +162,14 @@ func main() {
 		port = "8080"
 	}
 
-	log.Printf("🚀 Servidor WebSocket do Sinex Chat iniciado na porta %s", port)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadHeaderTimeout: 15 * time.Second,
+	}
+
+	log.Printf("Servidor WebSocket do Sinex Chat iniciado na porta %s", port)
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal("Erro fatal no servidor: ", err)
 	}
 }
