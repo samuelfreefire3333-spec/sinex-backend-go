@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -56,6 +57,17 @@ type Config struct {
 	MaxConexoes           int
 	MaxConexoesPorIP      int
 	MaxConexoesPorUsuario int
+
+	// Cloudinary: onde ficam fotos e áudios. O segredo só existe aqui, na
+	// variável de ambiente; sem as três, /midia/assinar responde 503.
+	CloudinaryNuvem   string
+	CloudinaryChave   string
+	CloudinarySegredo string
+}
+
+// CloudinaryConfigurado diz se dá para assinar envios de mídia.
+func (c Config) CloudinaryConfigurado() bool {
+	return c.CloudinaryNuvem != "" && c.CloudinaryChave != "" && c.CloudinarySegredo != ""
 }
 
 // Producao diz se o servidor está no ar para o público.
@@ -132,6 +144,13 @@ func CarregarConfig(getenv func(string) string) (Config, error) {
 	}
 	if cfg.MaxConexoesPorUsuario, err = lerInteiro(getenv, "MAX_CONNECTIONS_PER_USER", 10, 1, 1000); err != nil {
 		return Config{}, err
+	}
+
+	cfg.CloudinaryNuvem = strings.TrimSpace(getenv("CLOUDINARY_CLOUD_NAME"))
+	cfg.CloudinaryChave = strings.TrimSpace(getenv("CLOUDINARY_API_KEY"))
+	cfg.CloudinarySegredo = strings.TrimSpace(getenv("CLOUDINARY_API_SECRET"))
+	if !regexp.MustCompile(`^[a-z0-9_-]{0,64}$`).MatchString(cfg.CloudinaryNuvem) {
+		return Config{}, fmt.Errorf("CLOUDINARY_CLOUD_NAME inválido")
 	}
 	return cfg, nil
 }

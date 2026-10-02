@@ -94,6 +94,7 @@ func (s *servidor) rotas() http.Handler {
 	mux.HandleFunc("/admin/seguranca", comCORS(o, "GET", s.serveAdminSeguranca))
 	mux.HandleFunc("/admin/contadores", comCORS(o, "GET", s.serveAdminContadores))
 	mux.HandleFunc("/sessoes/revogar", comCORS(o, "POST", s.serveRevogarSessoes))
+	mux.HandleFunc("/midia/assinar", comCORS(o, "POST", s.serveAssinarMidia))
 	// report-to (Reporting API) entrega com pré-verificação CORS; report-uri
 	// chega sem Origin. Origem desconhecida não entra (evita que outro site
 	// aponte a CSP dele para cá e encha o registro).
